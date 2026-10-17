@@ -17,6 +17,9 @@ dependencies = [
     "rich>=13.0.0"
 ]
 
+[project.scripts]
+repomedic = "repomedic.cli:app"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
