@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from repomedic.security.armoriq_service import ArmorIQService, InvocationReceipt
 
@@ -24,16 +24,52 @@ class DiagnoserAgent:
     """
     Read-only Diagnoser agent.
     Inspects project source code, identifies root causes of build/test failures,
-    treats project files and README as untrusted, and establishes scoped edit permissions.
+    queries local Devstral Small 2 via Ollama, treats project files and README as untrusted,
+    and establishes scoped edit permissions.
     """
 
     def __init__(
         self,
         armoriq_service: Optional[ArmorIQService] = None,
         model_name: str = "devstral-small-2",
+        use_llm: bool = True,
     ):
         self.armoriq_service = armoriq_service
         self.model_name = model_name
+        self.use_llm = use_llm
+
+    def _call_devstral_diagnosis(
+        self,
+        source_files: Dict[str, str],
+        pasted_error: Optional[str] = None,
+    ) -> Optional[str]:
+        """Invoke local Devstral Small 2 via Ollama to generate plain-English diagnosis."""
+        if not self.use_llm:
+            return None
+        try:
+            from langchain_ollama import ChatOllama
+            llm = ChatOllama(model=self.model_name, temperature=0.0, timeout=30)
+            prompt_parts = [
+                "You are an AI code diagnoser. Analyze the following React/TypeScript files and error logs.",
+                "Identify all bugs, explain them in plain English, and describe the required fixes.\n",
+            ]
+            if pasted_error:
+                prompt_parts.append(f"Diagnostic Error Log:\n{pasted_error}\n")
+
+            for path, content in source_files.items():
+                prompt_parts.append(f"File: {path}\n```tsx\n{content}\n```\n")
+
+            prompt_parts.append(
+                "Provide a concise summary of the errors found and how to repair them for a beginner student."
+            )
+            logger.info("Diagnoser calling Devstral Small 2 through Ollama...")
+            response = llm.invoke("\n".join(prompt_parts))
+            if response and response.content:
+                logger.info("Devstral Small 2 diagnosis response received.")
+                return response.content.strip()
+        except Exception as exc:
+            logger.warning(f"Devstral Ollama call skipped or timed out: {exc}")
+        return None
 
     def diagnose(
         self,
@@ -66,7 +102,15 @@ class DiagnoserAgent:
                     "Protected MCP actions will be routed through ArmorIQ enforcement."
                 )
 
-        # 2. Inspect App.tsx for Type Error (Bug 1)
+        # 2. Gather source files for LLM analysis and rule checks
+        source_files: Dict[str, str] = {}
+        src_dir = workspace_dir / "src"
+        if src_dir.exists():
+            for f in src_dir.glob("*.tsx"):
+                if not f.name.endswith((".test.tsx", ".spec.tsx")):
+                    source_files[f"src/{f.name}"] = f.read_text(encoding="utf-8", errors="replace")
+
+        # 3. Inspect App.tsx for Type Error (Bug 1)
         app_path = workspace_dir / "src" / "App.tsx"
         if app_path.exists():
             app_text = app_path.read_text(encoding="utf-8", errors="replace")
@@ -78,7 +122,7 @@ class DiagnoserAgent:
                 plan.append("Fix src/App.tsx: Change string prop initialCount=\"...\" to numeric expression {0}.")
                 approved_files.append("src/App.tsx")
 
-        # 3. Inspect Counter.tsx for Logic Bug (Bug 2)
+        # 4. Inspect Counter.tsx for Logic Bug (Bug 2)
         counter_path = workspace_dir / "src" / "Counter.tsx"
         if counter_path.exists():
             counter_text = counter_path.read_text(encoding="utf-8", errors="replace")
@@ -90,6 +134,9 @@ class DiagnoserAgent:
                 plan.append("Fix src/Counter.tsx: Change decrement operation in handleIncrement to increment (count + 1).")
                 approved_files.append("src/Counter.tsx")
 
+        # 5. Call Devstral Small 2 through Ollama to generate rich analysis
+        devstral_summary = self._call_devstral_diagnosis(source_files, pasted_error)
+
         # If pasted error provided additional context
         if pasted_error:
             explanation_points.append(f"Diagnostic hint from user error log: {pasted_error[:100]}...")
@@ -100,7 +147,10 @@ class DiagnoserAgent:
             if not f.endswith((".test.tsx", ".test.ts", ".spec.tsx", ".spec.ts", ".config.ts", ".config.js", ".json"))
         ]
 
-        full_explanation = "\n".join(explanation_points) if explanation_points else "No obvious issues detected."
+        if devstral_summary:
+            full_explanation = f"[Devstral Small 2 Diagnosis]\n{devstral_summary}\n\n" + "\n".join(explanation_points)
+        else:
+            full_explanation = "\n".join(explanation_points) if explanation_points else "No obvious issues detected."
 
         return DiagnosisResult(
             explanation=full_explanation,

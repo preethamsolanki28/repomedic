@@ -2,10 +2,14 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
+
+# Load local environment credentials if present (keeps credentials out of git)
+load_dotenv()
 
 from repomedic.workspace import (
     WorkspaceManager,
