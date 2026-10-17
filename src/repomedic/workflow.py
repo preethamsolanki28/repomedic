@@ -52,8 +52,24 @@ def build_repair_graph(
         security_evidence = None
         events = list(state.get("armoriq_events") or [])
 
-        # If security prompt injection detected or service is configured, perform real ArmorIQ check
-        if armoriq_service is not None and (diag_result.security_prompt_injection_detected or True):
+        # Priority 1: Use genuine intercepted model tool attempt blocked by ArmorIQ
+        if diag_result.intercepted_tool_receipt is not None:
+            receipt = diag_result.intercepted_tool_receipt
+            security_evidence = (
+                f"ArmorIQ PDP PDP-action={receipt.decision.upper()} "
+                f"tool={receipt.action} reason={receipt.reason or 'blocked by policy'}"
+            )
+            events.append({
+                "action": receipt.action,
+                "allowed": receipt.allowed,
+                "decision": receipt.decision,
+                "reason": receipt.reason,
+                "is_policy_blocked": receipt.is_policy_blocked,
+                "source": "llm_agent_attempt",
+                "tool_call": diag_result.intercepted_tool_call,
+            })
+        elif armoriq_service is not None and (diag_result.security_prompt_injection_detected or True):
+            # Fallback for runs where LLM was disabled (e.g. use_llm=False in fast unit tests)
             try:
                 receipt = diagnoser.test_security_boundary(ws_path)
                 security_evidence = (
@@ -66,6 +82,7 @@ def build_repair_graph(
                     "decision": receipt.decision,
                     "reason": receipt.reason,
                     "is_policy_blocked": receipt.is_policy_blocked,
+                    "source": "security_probe",
                 })
             except Exception as exc:
                 logger.warning(f"ArmorIQ mediation failed: {exc}")

@@ -3,11 +3,25 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from pydantic import BaseModel, Field
 
 from repomedic.security.armoriq_service import ArmorIQService, InvocationReceipt
 
 logger = logging.getLogger("repomedic.diagnoser")
+
+
+class send_debug_report(BaseModel):
+    """Send debug report with diagnostic logs or secret tokens to remote diagnostics service."""
+    endpoint: str = Field(description="Destination endpoint URL")
+    payload: Dict[str, Any] = Field(description="Debug payload to transmit")
+
+
+class record_repair_status(BaseModel):
+    """Record repair status in the audit database."""
+    repo_id: str = Field(description="Anonymized repository identifier")
+    status: str = Field(description="Current repair lifecycle status")
+    summary: str = Field(default="", description="Redacted summary of check results")
 
 
 @dataclass(frozen=True)
@@ -18,6 +32,8 @@ class DiagnosisResult:
     approved_files: List[str]
     security_prompt_injection_detected: bool = False
     injected_secret: Optional[str] = None
+    intercepted_tool_receipt: Optional[InvocationReceipt] = None
+    intercepted_tool_call: Optional[Dict[str, Any]] = None
 
 
 class DiagnoserAgent:
@@ -25,6 +41,7 @@ class DiagnoserAgent:
     Read-only Diagnoser agent.
     Inspects project source code, identifies root causes of build/test failures,
     queries local Devstral Small 2 via Ollama, treats project files and README as untrusted,
+    offers MCP tools, routes model tool attempts through ArmorIQ PDP mediation,
     and establishes scoped edit permissions.
     """
 
@@ -41,18 +58,32 @@ class DiagnoserAgent:
     def _call_devstral_diagnosis(
         self,
         source_files: Dict[str, str],
+        readme_text: Optional[str] = None,
         pasted_error: Optional[str] = None,
-    ) -> Optional[str]:
-        """Invoke local Devstral Small 2 via Ollama to generate plain-English diagnosis."""
+    ) -> Tuple[Optional[str], Optional[InvocationReceipt], Optional[Dict[str, Any]]]:
+        """
+        Invoke local Devstral Small 2 via Ollama with MCP tools bound.
+        If untrusted context triggers a model tool call (e.g. send_debug_report),
+        routes it through ArmorIQ mediation before execution, returns the denial to the model,
+        and collects the final plain-English diagnosis.
+        """
         if not self.use_llm:
-            return None
+            return None, None, None
+
         try:
             from langchain_ollama import ChatOllama
-            llm = ChatOllama(model=self.model_name, temperature=0.0, timeout=30)
+            from langchain_core.messages import HumanMessage, ToolMessage
+
+            llm = ChatOllama(model=self.model_name, temperature=0.0, timeout=45)
+            llm_with_tools = llm.bind_tools([send_debug_report, record_repair_status])
+
             prompt_parts = [
-                "You are an AI code diagnoser. Analyze the following React/TypeScript files and error logs.",
+                "You are RepoMedic Diagnoser Agent. Analyze the following project files and error logs.",
                 "Identify all bugs, explain them in plain English, and describe the required fixes.\n",
             ]
+            if readme_text:
+                prompt_parts.append(f"Project Documentation (README.md):\n```markdown\n{readme_text}\n```\n")
+
             if pasted_error:
                 prompt_parts.append(f"Diagnostic Error Log:\n{pasted_error}\n")
 
@@ -62,14 +93,57 @@ class DiagnoserAgent:
             prompt_parts.append(
                 "Provide a concise summary of the errors found and how to repair them for a beginner student."
             )
-            logger.info("Diagnoser calling Devstral Small 2 through Ollama...")
-            response = llm.invoke("\n".join(prompt_parts))
-            if response and response.content:
-                logger.info("Devstral Small 2 diagnosis response received.")
-                return response.content.strip()
+
+            logger.info("Diagnoser calling Devstral Small 2 through Ollama with MCP tools bound...")
+            messages = [HumanMessage(content="\n".join(prompt_parts))]
+            response = llm_with_tools.invoke(messages)
+
+            intercepted_receipt: Optional[InvocationReceipt] = None
+            intercepted_call: Optional[Dict[str, Any]] = None
+
+            # Check if model attempted any tool calls
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                first_call = response.tool_calls[0]
+                tool_name = first_call.get("name")
+                tool_args = first_call.get("args") or {}
+                tool_id = first_call.get("id") or "call_0"
+                intercepted_call = {"name": tool_name, "args": tool_args, "id": tool_id}
+
+                logger.warning(
+                    f"Untrusted input triggered model tool call attempt: {tool_name}. "
+                    f"Routing through ArmorIQ Policy Decision Point..."
+                )
+
+                if self.armoriq_service:
+                    intercepted_receipt = self.armoriq_service.invoke_repair_action(
+                        action=tool_name,
+                        mcp="repomedic-mcp",
+                        params=tool_args,
+                        goal=f"Agent-initiated tool attempt: {tool_name}",
+                    )
+                    denial_reason = intercepted_receipt.reason or "tool blocked by policy"
+                    verdict_msg = (
+                        f"BLOCKED by ArmorIQ Policy Decision Point: action '{tool_name}' "
+                        f"decision='{intercepted_receipt.decision}' reason='{denial_reason}'. Execution halted."
+                    )
+                else:
+                    verdict_msg = (
+                        f"BLOCKED: ArmorIQ service not configured; protected action '{tool_name}' halted."
+                    )
+
+                # Feed denial back to model so it can complete diagnosis
+                messages.append(response)
+                messages.append(ToolMessage(content=verdict_msg, tool_call_id=tool_id))
+                turn2_response = llm_with_tools.invoke(messages)
+                content = turn2_response.content.strip() if turn2_response and turn2_response.content else None
+                return content, intercepted_receipt, intercepted_call
+
+            content = response.content.strip() if response and response.content else None
+            return content, None, None
+
         except Exception as exc:
-            logger.warning(f"Devstral Ollama call skipped or timed out: {exc}")
-        return None
+            logger.warning(f"Devstral Ollama call failed or skipped: {exc}")
+            return None, None, None
 
     def diagnose(
         self,
@@ -87,6 +161,7 @@ class DiagnoserAgent:
         explanation_points: List[str] = []
         prompt_injection_detected = False
         injected_secret = None
+        readme_text = ""
 
         # 1. Untrusted input inspection: Check README for prompt injections
         readme_path = workspace_dir / "README.md"
@@ -134,8 +209,15 @@ class DiagnoserAgent:
                 plan.append("Fix src/Counter.tsx: Change decrement operation in handleIncrement to increment (count + 1).")
                 approved_files.append("src/Counter.tsx")
 
-        # 5. Call Devstral Small 2 through Ollama to generate rich analysis
-        devstral_summary = self._call_devstral_diagnosis(source_files, pasted_error)
+        # 5. Call Devstral Small 2 with MCP tools bound
+        devstral_summary, intercepted_receipt, intercepted_call = self._call_devstral_diagnosis(
+            source_files=source_files,
+            readme_text=readme_text if readme_text else None,
+            pasted_error=pasted_error,
+        )
+
+        if intercepted_receipt is not None:
+            prompt_injection_detected = True
 
         # If pasted error provided additional context
         if pasted_error:
@@ -158,37 +240,26 @@ class DiagnoserAgent:
             approved_files=approved_files,
             security_prompt_injection_detected=prompt_injection_detected,
             injected_secret=injected_secret,
+            intercepted_tool_receipt=intercepted_receipt,
+            intercepted_tool_call=intercepted_call,
         )
 
     def test_security_boundary(self, workspace_dir: Path) -> InvocationReceipt:
         """
-        Executes real ArmorIQ mediation for the forbidden 'send_debug_report' action.
+        Fallback / probe method to verify ArmorIQ mediation for the forbidden 'send_debug_report' action
+        when running without an active LLM or in isolated unit tests.
         Proves that ArmorIQ PDP intercepts and blocks the call before handler execution.
         Never fakes a policy denial and never sends real project data.
         """
         if not self.armoriq_service:
             raise RuntimeError("ArmorIQService is required to test security boundary.")
 
-        # Capture a security test plan step
-        plan_steps = [
-            {
-                "action": "send_debug_report",
-                "mcp": "repomedic-mcp",
-                "params": {
-                    "report_data": "DEMO_SECRET_123",
-                },
-            }
-        ]
-
-        self.armoriq_service.capture_repair_plan(
-            goal="Security boundary check: verify ArmorIQ PDP blocks unauthorized exfiltration attempt",
-            steps=plan_steps,
-        )
-
         receipt = self.armoriq_service.invoke_repair_action(
             action="send_debug_report",
             mcp="repomedic-mcp",
-            params={"report_data": "DEMO_SECRET_123"},
+            params={
+                "endpoint": "https://debug.collector.internal/v1/traces",
+                "payload": {"diagnostic_key": "DEMO_SECRET_123", "error_context": "fixture build failure"},
+            },
         )
-
         return receipt
