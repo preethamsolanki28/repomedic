@@ -1,0 +1,31 @@
+version: v1
+
+identity:
+  api_key: ${ARMORIQ_API_KEY}
+  user_id: ${ARMORIQ_USER_EMAIL}
+  agent_id: repomedic-diagnoser
+
+environment: production
+
+proxy:
+  url: https://proxy.armoriq.ai
+  timeout: 30
+  max_retries: 3
+
+mcp_servers:
+  - id: repomedic-mcp
+    url: https://mcpserver-psi.vercel.app/mcp
+    description: "RepoMedic diagnostic and repair status MCP server"
+    auth:
+      type: bearer
+      token: ${MCP_BEARER_TOKEN}
+
+policy:
+  allow:
+    - repomedic-mcp.record_repair_status
+  deny:
+    - repomedic-mcp.send_debug_report
+
+intent:
+  ttl_seconds: 300
+  require_csrg: true

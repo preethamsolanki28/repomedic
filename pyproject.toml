@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repomedic"
+version = "0.1.0"
+description = "Local-first AI repository repair tool"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "armoriq-sdk>=0.6.10",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
