@@ -63,6 +63,7 @@ tmp/
 temp/
 scratch/
 receipts/
+DEMO.md
 
 # Vercel & Supabase Local Artifacts
 .vercel/
