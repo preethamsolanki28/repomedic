@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -108,13 +109,73 @@ def fix(
 
     console.print(f"[green]✓[/green] Isolated workspace created at: [dim]{ws_dir}[/dim]")
 
-    # 3. Agent diagnosis and repair step
-    # Note: AI agent workflow (Diagnoser -> Fixer -> Docker verify) will be wired in M3/M4.
-    # The workspace currently holds the clean isolated copy.
+    # 3. Agent diagnosis, repair, and verification step
+    console.print("[bold cyan]RepoMedic[/bold cyan] — Initiating LangGraph Diagnose → Fix → Docker Verify workflow...")
+
+    service = None
+    if os.getenv("ARMORIQ_API_KEY") and os.getenv("ARMORIQ_USER_EMAIL"):
+        try:
+            from repomedic.security.armoriq_service import ArmorIQService
+            service = ArmorIQService(config_path="armoriq.yaml")
+        except Exception as exc:
+            console.print(f"[dim]ArmorIQ disabled or unavailable: {exc}[/dim]")
+
+    nm_path = None
+    if (resolved_path / "node_modules").exists():
+        nm_path = str(resolved_path / "node_modules")
+
+    from repomedic.workflow import build_repair_graph, RepairState
+
+    graph = build_repair_graph(armoriq_service=service)
+    initial_state: RepairState = {
+        "workspace_dir": str(ws_dir),
+        "source_node_modules": nm_path,
+        "project_name": resolved_path.name,
+        "pasted_error": error_text,
+        "diagnosis": None,
+        "repair_plan": [],
+        "approved_files": [],
+        "check_results": [],
+        "retry_count": 0,
+        "armoriq_events": [],
+        "security_denial_evidence": None,
+        "status": "diagnosing",
+    }
+
+    try:
+        final_state = graph.invoke(initial_state)
+    except Exception as exc:
+        console.print(f"[bold red]Workflow error:[/bold red] {exc}")
+        wm.discard_workspace(ws_dir)
+        raise typer.Exit(code=1)
+
+    # 4. Terminal Repair Receipt
+    receipt_lines = []
+    if final_state.get("diagnosis"):
+        receipt_lines.append(f"[bold cyan]Diagnosis:[/bold cyan]\n{final_state['diagnosis']}\n")
+
+    if final_state.get("repair_plan"):
+        plan_str = "\n".join(f"  • {step}" for step in final_state["repair_plan"])
+        receipt_lines.append(f"[bold cyan]Repair Plan:[/bold cyan]\n{plan_str}\n")
+
+    if final_state.get("check_results"):
+        receipt_lines.append("[bold cyan]Verification Checks (Docker network=none):[/bold cyan]")
+        for cr in final_state["check_results"]:
+            icon = "[green]✓ PASSED[/green]" if cr.passed else "[red]✗ FAILED[/red]"
+            receipt_lines.append(f"  • {cr.name}: {icon} (exit code {cr.exit_code})")
+        receipt_lines.append("")
+
+    if final_state.get("security_denial_evidence"):
+        receipt_lines.append(f"[bold yellow]ArmorIQ Enforcement Evidence:[/bold yellow]\n  {final_state['security_denial_evidence']}\n")
+
+    status_color = "green" if final_state.get("status") == "complete" else "yellow"
+    receipt_lines.append(f"[bold]Workflow Outcome:[/bold] [{status_color}]{final_state.get('status', '').upper()}[/{status_color}] (Retries: {final_state.get('retry_count', 0)})")
+
+    console.print(Panel("\n".join(receipt_lines), title="[bold]RepoMedic Repair Receipt[/bold]", border_style=status_color))
 
     diff = wm.compute_diff(resolved_path, ws_dir)
 
-    # 4. Diff preview
+    # 5. Diff preview
     if diff:
         syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
         console.print(Panel(syntax, title="Proposed Changes (Unified Diff)", border_style="cyan"))

@@ -155,6 +155,27 @@ class ArmorIQService:
                 is_intent_mismatch=False,
             )
 
+    def invoke_repair_action(
+        self,
+        action: str,
+        mcp: str = "repomedic-mcp",
+        params: Optional[Dict[str, Any]] = None,
+        goal: Optional[str] = None,
+    ) -> InvocationReceipt:
+        """Convenience method to capture plan, mint token, and invoke protected tool through ArmorIQ."""
+        step_goal = goal or f"Execute repair action: {action}"
+        plan = self.capture_repair_plan(
+            goal=step_goal,
+            steps=[{"action": action, "mcp": mcp, "params": params or {}}],
+        )
+        token = self.mint_intent_token(plan)
+        return self.invoke_protected_tool(
+            mcp=mcp,
+            action=action,
+            intent_token=token,
+            params=params,
+        )
+
     @staticmethod
     def _sanitize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         """Redact known secret patterns to prevent accidental leakage in telemetry."""
